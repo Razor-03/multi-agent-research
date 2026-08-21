@@ -67,6 +67,95 @@ KNOWN_AGENTS = {"web_search", "synthesis", "report_writer"}
 
 
 # ---------------------------------------------------------------------------
+# Concurrency cap (#11 gap #1: rate limiting)
+#
+# Send fans out to however many tasks are READY, with no upper bound of its
+# own. Against a real API with real rate limits, an unbounded fan-out is a
+# genuine way to get throttled or burn budget fast -- not hypothetical.
+# LangGraph exposes `max_concurrency` on the RunnableConfig passed to
+# invoke(), which caps how many node executions run simultaneously across
+# the WHOLE graph step, regardless of how many Sends were emitted. This is
+# a hard infrastructure limit, separate from and layered UNDER whatever the
+# DAG says is theoretically parallelizable -- exactly the "two separate
+# constraints" point from our #11 discussion: the DAG says what COULD run
+# together, max_concurrency says how much of that we ACTUALLY let run at
+# once.
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_CONCURRENCY = 4
+
+
+# ---------------------------------------------------------------------------
+# Partial-failure policy (#11 gap #2 / #9)
+#
+# Before: the planner's "are we done" check only asked "has every task
+# reached a TERMINAL status" -- DONE, FAILED, and BLOCKED were all treated
+# as equally acceptable ways to be terminal. That's wrong: a plan where
+# every web_search task FAILED should not silently produce a "stub report:
+# 0/5 tasks completed" and call it success. We need an explicit policy for
+# what a mix of success/failure MEANS for the overall run, not just what it
+# means for each task individually.
+#
+# This mirrors the #9 distinction between "sub-agent handles its own
+# retries" and "planner handles plan-level consequences" -- individual task
+# failure was already handled (retry policy on Task). This is the layer
+# above: what does failure of one or more tasks mean for the OVERALL run.
+# ---------------------------------------------------------------------------
+
+class PlanOutcome:
+    SUCCESS = "success"                  # all tasks DONE
+    PARTIAL_SUCCESS = "partial_success"  # some DONE, some FAILED/BLOCKED, but
+                                          # enough succeeded to still produce
+                                          # a (degraded) result
+    FAILED = "failed"                    # too much failed to produce anything
+                                          # meaningful
+
+
+def assess_plan_outcome(tasks: dict[str, Task]) -> tuple[str, str]:
+    """Returns (outcome, explanation). Policy, stated explicitly rather
+    than left implicit:
+      - If ALL tasks are DONE -> SUCCESS.
+      - If a TERMINAL task (one nothing else depends on -- i.e. an end
+        product like report_writer) specifically FAILED or is BLOCKED ->
+        FAILED. We can't produce a final answer without it, regardless of
+        how many upstream searches succeeded.
+      - Otherwise, if at least one task DONE -> PARTIAL_SUCCESS (we have
+        SOMETHING to work with, even if degraded).
+      - If nothing succeeded at all -> FAILED.
+    """
+    done = [t for t in tasks.values() if t.status == TaskStatus.DONE]
+    failed_or_blocked = [
+        t for t in tasks.values() if t.status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+    ]
+
+    if not failed_or_blocked:
+        return PlanOutcome.SUCCESS, f"all {len(tasks)} tasks completed"
+
+    # Tasks with no dependents are "terminal" in the DAG sense -- nothing
+    # downstream needs them. If a TERMINAL task specifically failed, no
+    # amount of upstream success can produce a final result.
+    depended_on = {dep for t in tasks.values() for dep in t.depends_on}
+    terminal_task_ids = {tid for tid in tasks if tid not in depended_on}
+    terminal_failures = [t for t in failed_or_blocked if t.id in terminal_task_ids]
+
+    if terminal_failures:
+        names = [t.id for t in terminal_failures]
+        return (
+            PlanOutcome.FAILED,
+            f"terminal task(s) {names} did not complete -- no usable output",
+        )
+
+    if done:
+        return (
+            PlanOutcome.PARTIAL_SUCCESS,
+            f"{len(done)}/{len(tasks)} tasks completed; "
+            f"{len(failed_or_blocked)} failed/blocked but did not block the final output",
+        )
+
+    return PlanOutcome.FAILED, "no tasks completed successfully"
+
+
+# ---------------------------------------------------------------------------
 # Structured output schema for decomposition (#7: tool calling / structured
 # extraction -- we want typed objects back, not prose to parse)
 # ---------------------------------------------------------------------------
@@ -173,11 +262,13 @@ def planner_node(state: OrchestratorState) -> dict:
     all_terminal = all(t.status in TERMINAL_STATUSES for t in latest.values())
 
     if all_terminal:
-        done_count = sum(1 for t in latest.values() if t.status == TaskStatus.DONE)
+        # NEW: outcome is now an explicit policy decision, not just
+        # "everything reached a terminal status therefore we're happy."
+        outcome, explanation = assess_plan_outcome(latest)
         return {
             "tasks": updates,
             "is_complete": True,
-            "final_report": f"stub report: {done_count}/{len(latest)} tasks completed.",
+            "final_report": f"stub report [{outcome}]: {explanation}",
             "step_count": 1,
         }
 
@@ -313,8 +404,10 @@ def build_graph():
 # Two run modes
 # ---------------------------------------------------------------------------
 
-def run_live():
-    """Requires ANTHROPIC_API_KEY. Exercises the REAL decomposition call."""
+def run_live(max_concurrency: int = DEFAULT_MAX_CONCURRENCY):
+    """Requires ANTHROPIC_API_KEY. Exercises the REAL decomposition call.
+    `max_concurrency` caps simultaneous node executions per graph step --
+    this is the actual rate-limit guard, not just a suggestion."""
     app = build_graph()
     initial_state: OrchestratorState = {
         "user_request": "What are the tradeoffs between LangGraph and building a multi-agent system from scratch?",
@@ -324,7 +417,7 @@ def run_live():
         "final_report": None,
         "is_complete": False,
     }
-    result = app.invoke(initial_state)
+    result = app.invoke(initial_state, config={"max_concurrency": max_concurrency})
     _print_result(result)
 
 
@@ -353,11 +446,16 @@ def test_concurrency_proof():
         t.transition(TaskStatus.DONE, "slow search finished")
         return {"tasks": {t.id: t}, "step_count": 1}
 
+    # 4 tasks now, and we cap max_concurrency at 2 -- if the cap is
+    # respected, this should take ~2s (two batches of 2), NOT ~1s
+    # (uncapped, all 4 at once) and NOT ~4s (fully sequential).
     fake_tasks = {
         "s1": Task(id="s1", description="search A", assigned_agent="web_search"),
         "s2": Task(id="s2", description="search B", assigned_agent="web_search"),
         "s3": Task(id="s3", description="search C", assigned_agent="web_search"),
+        "s4": Task(id="s4", description="search D", assigned_agent="web_search"),
     }
+    concurrency_cap = 2
 
     original_decompose = decompose_request
     decompose_request = lambda user_request: fake_tasks
@@ -375,29 +473,37 @@ def test_concurrency_proof():
 
     try:
         wall_start = time.monotonic()
-        result = app.invoke({
-            "user_request": "fake (bypassed)",
-            "tasks": {},
-            "step_count": 0,
-            "max_steps": 25,
-            "final_report": None,
-            "is_complete": False,
-        })
+        result = app.invoke(
+            {
+                "user_request": "fake (bypassed)",
+                "tasks": {},
+                "step_count": 0,
+                "max_steps": 25,
+                "final_report": None,
+                "is_complete": False,
+            },
+            config={"max_concurrency": concurrency_cap},
+        )
         wall_elapsed = time.monotonic() - wall_start
     finally:
         decompose_request = original_decompose
 
-    print("=== CONCURRENCY PROOF ===")
-    print(f"3 tasks x 1.0s sleep each. Total wall time: {wall_elapsed:.2f}s\n")
+    print("=== CONCURRENCY CAP PROOF ===")
+    print(f"4 tasks x 1.0s sleep each, max_concurrency={concurrency_cap}.")
+    print(f"Total wall time: {wall_elapsed:.2f}s\n")
     for task_id, start, end in sorted(timing_log):
         print(f"  {task_id}: started at {start - wall_start:.2f}s, "
               f"finished at {end - wall_start:.2f}s")
-    if wall_elapsed < 2.0:
-        print(f"\nPASS: ran concurrently (~1s, not ~3s sequential)")
+    if 1.8 <= wall_elapsed < 3.5:
+        print(f"\nPASS: cap respected (~2s for 2 batches of 2, "
+              f"not ~1s uncapped or ~4s sequential)")
     else:
-        print(f"\nFAIL: appears sequential -- investigate")
+        print(f"\nUNEXPECTED timing -- investigate (got {wall_elapsed:.2f}s)")
     print()
     _print_result(result)
+    print()
+    outcome, explanation = assess_plan_outcome(result["tasks"])
+    print(f"=== PLAN OUTCOME ===\n{outcome}: {explanation}")
 
 
 def test_routing_only():

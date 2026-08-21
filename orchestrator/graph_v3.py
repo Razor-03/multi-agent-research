@@ -48,11 +48,11 @@ verify plumbing without burning API calls.
 from __future__ import annotations
 
 import os
-from typing import Any, Literal
+from typing import Literal, TypedDict
 
-from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
+from langgraph.types import Send
 from pydantic import BaseModel, Field
 
 from state import OrchestratorState, Task, TaskStatus
@@ -112,16 +112,14 @@ Rules:
 def decompose_request(user_request: str) -> dict[str, Task]:
     """The real #7 call: LLM + structured output -> typed Task objects.
     This REPLACES the hardcoded seeding from v2."""
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
     structured_llm = llm.with_structured_output(DecompositionPlan)
 
-    plan: DecompositionPlan = DecompositionPlan.model_validate(
-        structured_llm.invoke(
-            [
-                ("system", DECOMPOSITION_SYSTEM_PROMPT),
-                ("human", user_request),
-            ]
-        )
+    plan: DecompositionPlan = structured_llm.invoke(
+        [
+            ("system", DECOMPOSITION_SYSTEM_PROMPT),
+            ("human", user_request),
+        ]
     )
 
     tasks: dict[str, Task] = {}
@@ -147,8 +145,7 @@ def resolve_readiness(tasks: dict[str, Task]) -> dict[str, Task]:
         dep_statuses = [tasks[dep_id].status for dep_id in task.depends_on]
         if any(s in (TaskStatus.FAILED, TaskStatus.BLOCKED) for s in dep_statuses):
             t = task.model_copy(deep=True)
-            t.transition(TaskStatus.BLOCKED,
-                         f"upstream failed/blocked: {task.depends_on}")
+            t.transition(TaskStatus.BLOCKED, f"upstream failed/blocked: {task.depends_on}")
             updates[task_id] = t
             continue
         if all(s == TaskStatus.DONE for s in dep_statuses):
@@ -176,8 +173,7 @@ def planner_node(state: OrchestratorState) -> dict:
     all_terminal = all(t.status in TERMINAL_STATUSES for t in latest.values())
 
     if all_terminal:
-        done_count = sum(1 for t in latest.values()
-                         if t.status == TaskStatus.DONE)
+        done_count = sum(1 for t in latest.values() if t.status == TaskStatus.DONE)
         return {
             "tasks": updates,
             "is_complete": True,
@@ -186,6 +182,27 @@ def planner_node(state: OrchestratorState) -> dict:
         }
 
     return {"tasks": updates, "step_count": 1}
+
+
+# ---------------------------------------------------------------------------
+# WorkerInput -- the SCOPED context contract (#6), now literal.
+#
+# Previously every worker node re-scanned the ENTIRE `tasks` ledger to find
+# its own work. That was a workaround for not having per-invocation input.
+# With Send, each worker invocation gets EXACTLY what it needs: one task,
+# plus a compressed pointer to the original ask (per #6's "scoped context
+# is not context amnesia" rule -- the worker should still know what the
+# overall goal was, even scoped down to one task).
+#
+# This is a DIFFERENT state shape than OrchestratorState on purpose -- Send
+# explicitly supports invoking a node with custom state that differs from
+# the main graph state (see the Send docstring). The return value still
+# merges back into OrchestratorState via the normal `tasks` reducer.
+# ---------------------------------------------------------------------------
+
+class WorkerInput(TypedDict):
+    task: Task
+    user_request: str  # compressed top-level goal, per #6's anti-drift rule
 
 
 # ---------------------------------------------------------------------------
@@ -198,19 +215,12 @@ def mock_web_search(query: str) -> list[dict]:
     needs to change, because the agent node's CONTRACT (query in,
     structured results out) doesn't depend on the implementation."""
     return [
-        {"title": f"Result for: {query}",
-            "snippet": "...", "url": "https://example.com"}
+        {"title": f"Result for: {query}", "snippet": "...", "url": "https://example.com"}
     ]
 
 
-def web_search_node(state: OrchestratorState) -> dict:
-    tasks = state["tasks"]
-    ready = [t for t in tasks.values()
-             if t.status == TaskStatus.READY and t.assigned_agent == "web_search"]
-    if not ready:
-        return {"step_count": 1}
-
-    t = ready[0].model_copy(deep=True)
+def web_search_node(worker_input: WorkerInput) -> dict:
+    t = worker_input["task"].model_copy(deep=True)
     t.transition(TaskStatus.RUNNING, "web_search agent picked up task")
     try:
         results = mock_web_search(t.description)
@@ -220,33 +230,25 @@ def web_search_node(state: OrchestratorState) -> dict:
                 for r in results
             ]
         }
-        t.transition(TaskStatus.DONE,
-                     f"search returned {len(results)} results")
+        t.transition(TaskStatus.DONE, f"search returned {len(results)} results")
     except Exception as e:  # #9: real failures become ledger state, not crashes
         t.attempts += 1
         t.error = str(e)
         if t.attempts >= t.failure_policy.max_retries:
             t.transition(TaskStatus.FAILED, f"exhausted retries: {e}")
         else:
-            t.transition(TaskStatus.READY,
-                         f"attempt {t.attempts} failed, will retry: {e}")
+            t.transition(TaskStatus.READY, f"attempt {t.attempts} failed, will retry: {e}")
 
     return {"tasks": {t.id: t}, "step_count": 1}
 
 
 # ---------------------------------------------------------------------------
-# Stub agents: synthesis, report_writer (same pattern as v2's stub_worker,
-# just scoped to their own assigned_agent value now)
+# Stub agents: synthesis, report_writer -- same WorkerInput contract.
 # ---------------------------------------------------------------------------
 
 def make_stub_agent(agent_name: str):
-    def _node(state: OrchestratorState) -> dict:
-        tasks = state["tasks"]
-        ready = [t for t in tasks.values()
-                 if t.status == TaskStatus.READY and t.assigned_agent == agent_name]
-        if not ready:
-            return {"step_count": 1}
-        t = ready[0].model_copy(deep=True)
+    def _node(worker_input: WorkerInput) -> dict:
+        t = worker_input["task"].model_copy(deep=True)
         t.transition(TaskStatus.RUNNING, f"{agent_name} (stub) picked up task")
         t.result = {"note": f"stub output from {agent_name}"}
         t.transition(TaskStatus.DONE, f"{agent_name} (stub) finished")
@@ -259,31 +261,33 @@ report_writer_node = make_stub_agent("report_writer")
 
 
 # ---------------------------------------------------------------------------
-# Dispatch routing -- THE new piece. Inspects READY tasks' assigned_agent
-# and routes to the matching node name.
+# Dispatch routing -- NOW returns a LIST of Send objects, one per READY
+# task, instead of a single node name. This is the actual #11 payoff: every
+# READY task (regardless of how many, regardless of agent type mix) gets
+# dispatched in the SAME superstep, running concurrently. LangGraph
+# converges all their results before the planner runs again.
 # ---------------------------------------------------------------------------
 
-def route_after_planner(state: OrchestratorState) -> str:
+def route_after_planner(state: OrchestratorState):
     if state["step_count"] >= state["max_steps"]:
-        return "end"
+        return END
     if state.get("is_complete"):
-        return "end"
+        return END
 
-    ready = [t for t in state["tasks"].values() if t.status ==
-             TaskStatus.READY]
+    ready = [t for t in state["tasks"].values() if t.status == TaskStatus.READY]
     if not ready:
         # nothing ready right now (e.g. waiting on in-flight deps) -- loop
         # the planner again rather than dead-ending. Guarded by max_steps.
         return "planner"
 
-    # Route to whichever agent type the first READY task needs. See the
-    # module docstring for the honest caveat: with mixed READY agent
-    # types in one pass, only one gets dispatched this step.
-    target_agent = ready[0].assigned_agent
-    if target_agent not in KNOWN_AGENTS:
-        raise ValueError(
-            f"planner assigned unknown agent type: {target_agent}")
-    return target_agent
+    sends = []
+    for t in ready:
+        if t.assigned_agent not in KNOWN_AGENTS:
+            raise ValueError(f"planner assigned unknown agent type: {t.assigned_agent}")
+        sends.append(
+            Send(t.assigned_agent, {"task": t, "user_request": state["user_request"]})
+        )
+    return sends
 
 
 def build_graph():
@@ -294,17 +298,11 @@ def build_graph():
     graph.add_node("report_writer", report_writer_node)
 
     graph.set_entry_point("planner")
-    graph.add_conditional_edges(
-        "planner",
-        route_after_planner,
-        {
-            "planner": "planner",
-            "web_search": "web_search",
-            "synthesis": "synthesis",
-            "report_writer": "report_writer",
-            "end": END,
-        },
-    )
+    # No explicit mapping dict needed here -- route_after_planner returns
+    # either a plain node name (str), END, or a list of Send objects, and
+    # LangGraph resolves Send targets dynamically at runtime.
+    graph.add_conditional_edges("planner", route_after_planner)
+
     for agent in ("web_search", "synthesis", "report_writer"):
         graph.add_edge(agent, "planner")
 
@@ -330,6 +328,78 @@ def run_live():
     _print_result(result)
 
 
+def test_concurrency_proof():
+    """No API key needed. Proves tasks dispatched via Send actually run
+    CONCURRENTLY (not just correctly) by having each worker sleep and
+    recording wall-clock start/end times. If truly concurrent, 3 tasks
+    each sleeping 1s should take ~1s total, not ~3s."""
+    import time
+    import threading
+
+    global decompose_request
+
+    timing_log = []
+    lock = threading.Lock()
+
+    def slow_web_search_node(worker_input: WorkerInput) -> dict:
+        t = worker_input["task"].model_copy(deep=True)
+        start = time.monotonic()
+        t.transition(TaskStatus.RUNNING, "slow web_search picked up task")
+        time.sleep(1.0)  # simulate a real network-bound search call
+        end = time.monotonic()
+        with lock:
+            timing_log.append((t.id, start, end))
+        t.result = {"claims": [{"text": "slow result", "source": "mock", "confidence": 0.7}]}
+        t.transition(TaskStatus.DONE, "slow search finished")
+        return {"tasks": {t.id: t}, "step_count": 1}
+
+    fake_tasks = {
+        "s1": Task(id="s1", description="search A", assigned_agent="web_search"),
+        "s2": Task(id="s2", description="search B", assigned_agent="web_search"),
+        "s3": Task(id="s3", description="search C", assigned_agent="web_search"),
+    }
+
+    original_decompose = decompose_request
+    decompose_request = lambda user_request: fake_tasks
+
+    graph = StateGraph(OrchestratorState)
+    graph.add_node("planner", planner_node)
+    graph.add_node("web_search", slow_web_search_node)
+    graph.add_node("synthesis", synthesis_node)
+    graph.add_node("report_writer", report_writer_node)
+    graph.set_entry_point("planner")
+    graph.add_conditional_edges("planner", route_after_planner)
+    for agent in ("web_search", "synthesis", "report_writer"):
+        graph.add_edge(agent, "planner")
+    app = graph.compile()
+
+    try:
+        wall_start = time.monotonic()
+        result = app.invoke({
+            "user_request": "fake (bypassed)",
+            "tasks": {},
+            "step_count": 0,
+            "max_steps": 25,
+            "final_report": None,
+            "is_complete": False,
+        })
+        wall_elapsed = time.monotonic() - wall_start
+    finally:
+        decompose_request = original_decompose
+
+    print("=== CONCURRENCY PROOF ===")
+    print(f"3 tasks x 1.0s sleep each. Total wall time: {wall_elapsed:.2f}s\n")
+    for task_id, start, end in sorted(timing_log):
+        print(f"  {task_id}: started at {start - wall_start:.2f}s, "
+              f"finished at {end - wall_start:.2f}s")
+    if wall_elapsed < 2.0:
+        print(f"\nPASS: ran concurrently (~1s, not ~3s sequential)")
+    else:
+        print(f"\nFAIL: appears sequential -- investigate")
+    print()
+    _print_result(result)
+
+
 def test_routing_only():
     """No API key needed. Injects a fake decomposition (bypassing
     decompose_request entirely) to prove the DISPATCH/ROUTING logic works
@@ -352,7 +422,7 @@ def test_routing_only():
     # monkeypatch decompose_request so planner_node's first branch uses our
     # fake plan instead of calling a real LLM
     original = decompose_request
-    def decompose_request(user_request): return fake_tasks
+    decompose_request = lambda user_request: fake_tasks
 
     try:
         app = build_graph()
@@ -378,16 +448,17 @@ def _print_result(result):
     print()
     print("=== FULL LEDGER TRACE ===")
     for task_id, task in sorted(result["tasks"].items()):
-        print(
-            f"\n[{task_id}] agent={task.assigned_agent} depends_on={task.depends_on}")
+        print(f"\n[{task_id}] agent={task.assigned_agent} depends_on={task.depends_on}")
         for event in task.history:
-            print(
-                f"    {event.from_status} -> {event.to_status} :: {event.detail}")
+            print(f"    {event.from_status} -> {event.to_status} :: {event.detail}")
 
 
 if __name__ == "__main__":
-    if os.environ.get("GOOGLE_API_KEY"):
+    import sys
+    if "--concurrency" in sys.argv:
+        test_concurrency_proof()
+    elif os.environ.get("ANTHROPIC_API_KEY"):
         run_live()
     else:
-        print("(no GOOGLE_API_KEY found -- running routing-only test instead)\n")
+        print("(no ANTHROPIC_API_KEY found -- running routing-only test instead)\n")
         test_routing_only()

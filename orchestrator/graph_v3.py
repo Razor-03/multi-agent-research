@@ -50,7 +50,8 @@ from __future__ import annotations
 import os
 from typing import Literal, TypedDict
 
-from langchain_anthropic import ChatAnthropic
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send
 from pydantic import BaseModel, Field
@@ -201,14 +202,16 @@ Rules:
 def decompose_request(user_request: str) -> dict[str, Task]:
     """The real #7 call: LLM + structured output -> typed Task objects.
     This REPLACES the hardcoded seeding from v2."""
-    llm = ChatAnthropic(model="claude-sonnet-4-6", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     structured_llm = llm.with_structured_output(DecompositionPlan)
 
-    plan: DecompositionPlan = structured_llm.invoke(
-        [
-            ("system", DECOMPOSITION_SYSTEM_PROMPT),
-            ("human", user_request),
-        ]
+    plan: DecompositionPlan = DecompositionPlan.model_validate(
+        structured_llm.invoke(
+            [
+                ("system", DECOMPOSITION_SYSTEM_PROMPT),
+                ("human", user_request),
+            ]
+        )
     )
 
     tasks: dict[str, Task] = {}
@@ -563,8 +566,8 @@ if __name__ == "__main__":
     import sys
     if "--concurrency" in sys.argv:
         test_concurrency_proof()
-    elif os.environ.get("ANTHROPIC_API_KEY"):
+    elif os.environ.get("GOOGLE_API_KEY"):
         run_live()
     else:
-        print("(no ANTHROPIC_API_KEY found -- running routing-only test instead)\n")
+        print("(no GOOGLE_API_KEY found -- running routing-only test instead)\n")
         test_routing_only()

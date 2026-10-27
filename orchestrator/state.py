@@ -166,3 +166,11 @@ class OrchestratorState(TypedDict):
     # Terminal flag the planner sets explicitly -- convergence must be a
     # deliberate decision, never inferred.
     is_complete: bool
+
+    # HITL fields (added when we introduced human-in-the-loop review).
+    # `needs_human_review`: the planner sets this instead of is_complete
+    # when the judge's verdict is "fail" and no human has weighed in yet.
+    # `human_reviewed`: set True once a human has made a decision, so the
+    # planner doesn't loop back into review after an "accept" decision.
+    needs_human_review: bool
+    human_reviewed: bool
